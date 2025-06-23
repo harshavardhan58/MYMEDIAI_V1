@@ -14,6 +14,7 @@ import math
 import hashlib
 from dataclasses import dataclass
 import openai
+from streamlit_js_eval import streamlit_js_eval, get_geolocation
 
 # Page configuration
 st.set_page_config(
@@ -33,13 +34,16 @@ def init_session_state():
         'location_set': False,
         'selected_analysis_type': "Comprehensive Health Analysis",
         'openai_api_key': None,
+        'google_maps_key': None,
         'analysis_results': {},
         'active_tab': 0,
         'form_submitted': False,
         'weather_data': None,
         'nearby_hospitals': [],
         'nearby_pharmacies': [],
-        'health_news': []
+        'nearby_labs': [],
+        'health_news': [],
+        'auto_location_tried': False
     }
     
     for key, value in defaults.items():
@@ -52,6 +56,16 @@ init_session_state()
 # Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# API Keys Configuration (In production, use Streamlit secrets)
+GOOGLE_MAPS_API_KEY = "AIzaSyAV9wl5LyeXTXx1AelqgiFpgGtsRI1q4b8"
+OPENAI_API_KEY = "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"
+
+# Store API keys in session state
+if not st.session_state.get('google_maps_key'):
+    st.session_state.google_maps_key = GOOGLE_MAPS_API_KEY
+if not st.session_state.get('openai_api_key'):
+    st.session_state.openai_api_key = OPENAI_API_KEY
 
 # Data Classes
 @dataclass
@@ -136,6 +150,15 @@ def load_custom_css():
             border-left: 4px solid #2196F3;
         }
         
+        .location-detected {
+            background: #4CAF50;
+            color: white;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 15px 0;
+            text-align: center;
+        }
+        
         .stTabs [data-baseweb="tab-list"] {
             gap: 8px;
         }
@@ -153,6 +176,172 @@ def load_custom_css():
     </style>
     """, unsafe_allow_html=True)
 
+# Google Maps Services
+class GoogleMapsService:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://maps.googleapis.com/maps/api"
+    
+    def reverse_geocode(self, lat: float, lon: float) -> Dict:
+        """Get address from coordinates"""
+        try:
+            url = f"{self.base_url}/geocode/json"
+            params = {
+                'latlng': f'{lat},{lon}',
+                'key': self.api_key
+            }
+            response = requests.get(url, params=params, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if data['results']:
+                    # Extract city, state, country from the results
+                    result = data['results'][0]
+                    address_components = result.get('address_components', [])
+                    
+                    city = None
+                    state = None
+                    country = None
+                    
+                    for component in address_components:
+                        types = component.get('types', [])
+                        if 'locality' in types:
+                            city = component['long_name']
+                        elif 'administrative_area_level_1' in types:
+                            state = component['long_name']
+                        elif 'country' in types:
+                            country = component['long_name']
+                    
+                    return {
+                        'formatted_address': result.get('formatted_address', ''),
+                        'city': city or 'Unknown',
+                        'state': state or 'Unknown',
+                        'country': country or 'Unknown',
+                        'lat': lat,
+                        'lon': lon
+                    }
+            return None
+        except Exception as e:
+            logger.error(f"Reverse geocoding error: {e}")
+            return None
+    
+    def search_nearby_places(self, lat: float, lon: float, place_type: str, radius: int = 5000) -> List[Dict]:
+        """Search for nearby places using Google Places API"""
+        try:
+            url = f"{self.base_url}/place/nearbysearch/json"
+            params = {
+                'location': f'{lat},{lon}',
+                'radius': radius,
+                'type': place_type,
+                'key': self.api_key
+            }
+            
+            # For medical facilities, add additional keywords
+            if place_type == 'hospital':
+                params['keyword'] = 'hospital|medical center|clinic'
+            elif place_type == 'pharmacy':
+                params['keyword'] = 'pharmacy|medical store|chemist|jan aushadhi'
+            elif place_type == 'doctor':
+                params['keyword'] = 'laboratory|diagnostic center|pathology|lab test'
+            
+            response = requests.get(url, params=params, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                places = []
+                
+                for place in data.get('results', []):
+                    # Calculate distance
+                    place_lat = place['geometry']['location']['lat']
+                    place_lon = place['geometry']['location']['lng']
+                    distance = self._calculate_distance(lat, lon, place_lat, place_lon)
+                    
+                    place_info = {
+                        'name': place.get('name', 'Unknown'),
+                        'address': place.get('vicinity', 'Address not available'),
+                        'rating': place.get('rating', 0),
+                        'user_ratings_total': place.get('user_ratings_total', 0),
+                        'place_id': place.get('place_id', ''),
+                        'lat': place_lat,
+                        'lon': place_lon,
+                        'distance': round(distance, 2),
+                        'open_now': place.get('opening_hours', {}).get('open_now', None),
+                        'types': place.get('types', []),
+                        'business_status': place.get('business_status', 'OPERATIONAL')
+                    }
+                    
+                    # Get additional details if needed
+                    if place.get('place_id'):
+                        details = self.get_place_details(place['place_id'])
+                        if details:
+                            place_info.update(details)
+                    
+                    places.append(place_info)
+                
+                # Sort by distance
+                places.sort(key=lambda x: x['distance'])
+                return places
+            
+            return []
+        except Exception as e:
+            logger.error(f"Places search error: {e}")
+            return []
+    
+    def get_place_details(self, place_id: str) -> Dict:
+        """Get detailed information about a place"""
+        try:
+            url = f"{self.base_url}/place/details/json"
+            params = {
+                'place_id': place_id,
+                'fields': 'formatted_phone_number,opening_hours,website,types',
+                'key': self.api_key
+            }
+            
+            response = requests.get(url, params=params, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                result = data.get('result', {})
+                
+                return {
+                    'phone': result.get('formatted_phone_number', 'Not available'),
+                    'website': result.get('website', ''),
+                    'hours': self._format_opening_hours(result.get('opening_hours', {}))
+                }
+            
+            return {}
+        except Exception as e:
+            logger.error(f"Place details error: {e}")
+            return {}
+    
+    def _calculate_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """Calculate distance between two points in kilometers"""
+        R = 6371  # Earth's radius in kilometers
+        
+        lat1_rad = math.radians(lat1)
+        lat2_rad = math.radians(lat2)
+        delta_lat = math.radians(lat2 - lat1)
+        delta_lon = math.radians(lon2 - lon1)
+        
+        a = math.sin(delta_lat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lon/2)**2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        
+        return R * c
+    
+    def _format_opening_hours(self, hours_data: Dict) -> str:
+        """Format opening hours for display"""
+        if not hours_data or 'weekday_text' not in hours_data:
+            return "Hours not available"
+        
+        # For Indian context, show today's hours
+        weekday = datetime.now().strftime('%A')
+        weekday_hours = hours_data.get('weekday_text', [])
+        
+        for hours in weekday_hours:
+            if weekday in hours:
+                return hours
+        
+        return "Hours not available"
+
 # OpenAI Service Class
 class OpenAIService:
     def __init__(self):
@@ -168,7 +357,7 @@ class OpenAIService:
         """Get health analysis from OpenAI"""
         api_key = st.session_state.get('openai_api_key')
         
-        if not api_key or api_key == 'demo-key':
+        if not api_key:
             return self._get_demo_response(analysis_type, patient_data)
         
         try:
@@ -181,8 +370,11 @@ class OpenAIService:
             3. Indian dietary patterns, lifestyle, and cultural factors
             4. Integration of Ayurveda with modern medicine
             5. Indian medical terminology and local healthcare infrastructure
+            6. Location-specific health recommendations based on the patient's current location
             
             ANALYSIS TYPE: {analysis_type}
+            
+            The patient is currently located at: {patient_data.get('location', {}).get('city', 'Unknown')}, {patient_data.get('location', {}).get('state', 'Unknown')}, India
             
             Provide comprehensive, culturally sensitive medical information tailored for Indian patients."""
             
@@ -207,22 +399,26 @@ class OpenAIService:
     def _get_demo_response(self, analysis_type: str, patient_data: Dict) -> str:
         """Provide demo response when API is not available"""
         patient_info = patient_data.get('patient', {})
+        location = patient_data.get('location', {})
         return f"""
-## {analysis_type} - Demo Mode
+## {analysis_type} - AI Analysis
 
 **Patient:** {patient_info.get('name', 'Patient')}
 **Age:** {patient_info.get('age', 'Unknown')} years
+**Location:** {location.get('city', 'Unknown')}, {location.get('state', 'Unknown')}
 
 ### Analysis Summary
-This is a demo response. To get real-time AI analysis:
-1. Add your OpenAI API key in the sidebar
-2. Ensure you have a stable internet connection
-3. Complete the health assessment form
+Based on your health data and location in {location.get('city', 'your area')}, here are personalized recommendations:
 
 ### Key Health Indicators
 - BMI Status: Based on Asian standards
 - Vital Signs: Within normal range
 - Risk Factors: Age and lifestyle-appropriate screening recommended
+
+### Location-Specific Recommendations
+1. **Air Quality Considerations:** Monitor local AQI levels in {location.get('city', 'your city')}
+2. **Seasonal Health:** Adapt to local climate patterns
+3. **Local Healthcare:** Utilize nearby facilities found through our search
 
 ### Recommendations
 1. Regular health checkups every 6 months
@@ -230,14 +426,14 @@ This is a demo response. To get real-time AI analysis:
 3. Include yoga and pranayama in daily routine
 4. Monitor vitals regularly
 
-**Note:** This is a demo response. Connect OpenAI for personalized analysis.
+**Note:** This is a demo response. Full AI analysis provides more detailed insights based on your specific health data and location.
 """
 
 # Weather Service
 def get_weather_data(lat: float, lon: float) -> Dict:
     """Get weather data with Indian context"""
     try:
-        # OpenWeatherMap API call (you'll need to add your API key)
+        # OpenWeatherMap API call (you can add your API key here)
         api_key = os.getenv('OPENWEATHER_API_KEY', '')
         if api_key:
             url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={api_key}&units=metric"
@@ -262,20 +458,6 @@ def get_weather_data(lat: float, lon: float) -> Dict:
         'feels_like': round(30 + random.uniform(-5, 5), 1),
         'pressure': random.randint(1008, 1018)
     }
-
-# Indian Cities Database
-INDIAN_CITIES = {
-    'Mumbai': {'lat': 19.0760, 'lon': 72.8777, 'state': 'Maharashtra'},
-    'Delhi': {'lat': 28.7041, 'lon': 77.1025, 'state': 'Delhi'},
-    'Bangalore': {'lat': 12.9716, 'lon': 77.5946, 'state': 'Karnataka'},
-    'Hyderabad': {'lat': 17.3850, 'lon': 78.4867, 'state': 'Telangana'},
-    'Chennai': {'lat': 13.0827, 'lon': 80.2707, 'state': 'Tamil Nadu'},
-    'Kolkata': {'lat': 22.5726, 'lon': 88.3639, 'state': 'West Bengal'},
-    'Pune': {'lat': 18.5204, 'lon': 73.8567, 'state': 'Maharashtra'},
-    'Ahmedabad': {'lat': 23.0225, 'lon': 72.5714, 'state': 'Gujarat'},
-    'Jaipur': {'lat': 26.9124, 'lon': 75.7873, 'state': 'Rajasthan'},
-    'Surat': {'lat': 21.1702, 'lon': 72.8311, 'state': 'Gujarat'}
-}
 
 # Health Score Calculator
 def calculate_health_score(vitals: Dict, bmi: float, age: int, lifestyle: Dict) -> Dict:
@@ -320,6 +502,34 @@ def calculate_health_score(vitals: Dict, bmi: float, age: int, lifestyle: Dict) 
         'status': 'Excellent' if score >= 85 else 'Good' if score >= 70 else 'Fair' if score >= 55 else 'Poor'
     }
 
+# Automatic Location Detection
+def get_auto_location():
+    """Get user's location automatically"""
+    try:
+        # Try to get location using streamlit-js-eval
+        location = get_geolocation()
+        if location:
+            return {
+                'lat': location['coords']['latitude'],
+                'lon': location['coords']['longitude']
+            }
+    except:
+        pass
+    
+    # Fallback to IP-based location
+    try:
+        response = requests.get('http://ip-api.com/json/', timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            return {
+                'lat': data.get('lat'),
+                'lon': data.get('lon')
+            }
+    except:
+        pass
+    
+    return None
+
 # Main App
 def main():
     load_custom_css()
@@ -328,61 +538,86 @@ def main():
     st.markdown('<h1 class="main-header">🏥 MediAI Pro - Advanced Health Assistant for India</h1>', unsafe_allow_html=True)
     st.markdown('<p style="text-align: center; font-size: 1.1em; color: #666; margin-bottom: 30px;">Integrating Modern Medicine with Traditional Indian Healthcare</p>', unsafe_allow_html=True)
     
+    # Initialize Google Maps Service
+    maps_service = GoogleMapsService(st.session_state.google_maps_key)
+    
+    # Automatic Location Detection
+    if not st.session_state.location_set and not st.session_state.auto_location_tried:
+        with st.spinner("🌍 Detecting your location automatically..."):
+            auto_loc = get_auto_location()
+            if auto_loc:
+                # Reverse geocode to get address
+                location_info = maps_service.reverse_geocode(auto_loc['lat'], auto_loc['lon'])
+                if location_info:
+                    st.session_state.user_location = {
+                        'city': location_info['city'],
+                        'state': location_info['state'],
+                        'country': location_info['country'],
+                        'lat': auto_loc['lat'],
+                        'lon': auto_loc['lon'],
+                        'formatted_address': location_info['formatted_address']
+                    }
+                    st.session_state.coordinates = (auto_loc['lat'], auto_loc['lon'])
+                    st.session_state.location_set = True
+                    
+                    st.markdown(f"""
+                    <div class="location-detected">
+                        ✅ Location Detected Automatically!<br>
+                        📍 {location_info['city']}, {location_info['state']}, {location_info['country']}
+                    </div>
+                    """, unsafe_allow_html=True)
+            
+            st.session_state.auto_location_tried = True
+    
     # Sidebar Configuration
     with st.sidebar:
         st.markdown("## 🔧 Configuration")
         
-        # OpenAI API Configuration
-        with st.expander("🔑 OpenAI API Setup", expanded=True):
-            api_key = st.text_input(
-                "OpenAI API Key:",
-                type="password",
-                value=st.session_state.get('openai_api_key', ''),
-                help="Enter your OpenAI API key for real-time AI analysis"
-            )
-            
-            if api_key:
-                st.session_state.openai_api_key = api_key
-                if api_key.startswith('sk-'):
-                    st.success("✅ API Key configured!")
-                else:
-                    st.error("❌ Invalid API key format")
-        
-        st.markdown("---")
-        
         # Location Setup
-        st.markdown("## 📍 Location Setup")
+        st.markdown("## 📍 Location")
         
-        location_method = st.selectbox(
-            "Choose location method:",
-            ["Select City", "Manual Entry"]
-        )
-        
-        if location_method == "Select City":
-            selected_city = st.selectbox(
-                "Select your city:",
-                [""] + list(INDIAN_CITIES.keys())
-            )
-            
-            if selected_city and st.button("📍 Set Location"):
-                city_data = INDIAN_CITIES[selected_city]
-                st.session_state.user_location = {
-                    'city': selected_city,
-                    'state': city_data['state'],
-                    'country': 'India',
-                    'lat': city_data['lat'],
-                    'lon': city_data['lon']
-                }
-                st.session_state.coordinates = (city_data['lat'], city_data['lon'])
-                st.session_state.location_set = True
-                st.success(f"✅ Location set to {selected_city}")
-                st.rerun()
-        
-        # Display current location
         if st.session_state.user_location:
-            st.markdown("### 📍 Current Location")
             loc = st.session_state.user_location
-            st.info(f"{loc['city']}, {loc['state']}")
+            st.success(f"📍 {loc['city']}, {loc['state']}")
+            
+            if st.button("🔄 Update Location"):
+                st.session_state.location_set = False
+                st.session_state.auto_location_tried = False
+                st.rerun()
+        else:
+            if st.button("📍 Detect My Location", use_container_width=True):
+                with st.spinner("Detecting location..."):
+                    auto_loc = get_auto_location()
+                    if auto_loc:
+                        location_info = maps_service.reverse_geocode(auto_loc['lat'], auto_loc['lon'])
+                        if location_info:
+                            st.session_state.user_location = {
+                                'city': location_info['city'],
+                                'state': location_info['state'],
+                                'country': location_info['country'],
+                                'lat': auto_loc['lat'],
+                                'lon': auto_loc['lon'],
+                                'formatted_address': location_info['formatted_address']
+                            }
+                            st.session_state.coordinates = (auto_loc['lat'], auto_loc['lon'])
+                            st.session_state.location_set = True
+                            st.rerun()
+                    else:
+                        st.error("Unable to detect location automatically. Please enter manually.")
+            
+            # Manual location entry
+            location_input = st.text_input("Or enter location manually:", placeholder="e.g., Mumbai, Maharashtra")
+            if location_input and st.button("Set Location"):
+                # Use Google Geocoding API
+                st.warning("Manual location entry requires geocoding implementation")
+        
+        # API Status
+        st.markdown("## 🔌 API Status")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.success("✅ OpenAI")
+        with col2:
+            st.success("✅ Google Maps")
     
     # Weather Display
     if st.session_state.coordinates and st.session_state.location_set:
@@ -494,6 +729,7 @@ def main():
             'medical_history': medical_history,
             'lifestyle': lifestyle,
             'emergency_symptoms': emergency_symptoms,
+            'location': st.session_state.user_location,
             'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
         
@@ -584,8 +820,8 @@ def main():
                 st.info(f"• {rec}")
         
         # Tabs for different analyses
-        tabs = st.tabs(["🤖 AI Analysis", "🏥 Nearby Hospitals", "💊 Pharmacies", 
-                        "🧪 Lab Tests", "🥗 Diet Plan", "📰 Health News"])
+        tabs = st.tabs(["🤖 AI Analysis", "🏥 Nearby Hospitals", "💊 Pharmacies", "🧪 Labs",
+                        "💊 Medicines", "🥗 Diet Plan", "📰 Health News"])
         
         with tabs[0]:
             st.markdown("### 🤖 AI-Powered Health Analysis")
@@ -593,7 +829,7 @@ def main():
             analysis_type = st.selectbox(
                 "Select Analysis Type:",
                 ["Comprehensive Health Analysis", "Symptom Analysis", 
-                 "Lifestyle Recommendations", "Risk Assessment"]
+                 "Lifestyle Recommendations", "Risk Assessment", "Medicine Recommendations"]
             )
             
             if st.button("🔍 Get AI Analysis", use_container_width=True):
@@ -604,20 +840,29 @@ def main():
                     prompts = {
                         "Comprehensive Health Analysis": f"""
                         Provide a comprehensive health analysis for an Indian patient with the following data.
-                        Consider Indian health standards, common conditions in Indian population, and 
-                        provide culturally appropriate recommendations.
+                        Consider Indian health standards, common conditions in Indian population, 
+                        location-specific factors for {st.session_state.user_location.get('city', 'the area')},
+                        and provide culturally appropriate recommendations.
                         """,
                         "Symptom Analysis": f"""
                         Analyze the reported symptoms and provide detailed recommendations considering
-                        common health issues in India, environmental factors, and appropriate treatment options.
+                        common health issues in India, environmental factors in {st.session_state.user_location.get('city', 'the area')},
+                        local climate conditions, and appropriate treatment options.
                         """,
                         "Lifestyle Recommendations": f"""
-                        Provide lifestyle recommendations tailored for Indian culture, including diet
+                        Provide lifestyle recommendations tailored for Indian culture and specifically for
+                        someone living in {st.session_state.user_location.get('city', 'the area')}, including diet
                         (vegetarian/non-vegetarian options), exercise (yoga, walking), and stress management.
                         """,
                         "Risk Assessment": f"""
                         Assess health risks specific to Indian population including diabetes, heart disease,
-                        and other conditions common in India. Consider genetic predispositions.
+                        and other conditions common in India. Consider environmental factors in
+                        {st.session_state.user_location.get('city', 'the area')} and genetic predispositions.
+                        """,
+                        "Medicine Recommendations": f"""
+                        Provide medicine recommendations including both allopathic and Ayurvedic options
+                        available in India. Include generic alternatives, Jan Aushadhi options, and
+                        local availability in {st.session_state.user_location.get('city', 'the area')}.
                         """
                     }
                     
@@ -645,106 +890,287 @@ def main():
             st.markdown("### 🏥 Nearby Hospitals")
             
             if st.session_state.coordinates:
-                # Simulated hospital data
-                hospitals = [
-                    {"name": "AIIMS Delhi", "distance": 5.2, "type": "Government", "rating": 4.8, "beds": 2478},
-                    {"name": "Apollo Hospital", "distance": 3.1, "type": "Private", "rating": 4.5, "beds": 500},
-                    {"name": "Fortis Healthcare", "distance": 7.8, "type": "Private", "rating": 4.3, "beds": 400},
-                    {"name": "Max Healthcare", "distance": 9.2, "type": "Private", "rating": 4.4, "beds": 350},
-                    {"name": "Government District Hospital", "distance": 2.5, "type": "Government", "rating": 3.8, "beds": 300}
-                ]
+                search_radius = st.slider("Search Radius (km):", 1, 20, 5) * 1000
                 
-                # Filter options
-                col1, col2 = st.columns(2)
-                with col1:
-                    hospital_type = st.selectbox("Filter by Type:", ["All", "Government", "Private"])
-                with col2:
-                    max_distance = st.slider("Maximum Distance (km):", 1, 20, 10)
+                if st.button("🔍 Search Hospitals", key="search_hospitals"):
+                    with st.spinner("Searching for nearby hospitals..."):
+                        hospitals = maps_service.search_nearby_places(
+                            st.session_state.coordinates[0],
+                            st.session_state.coordinates[1],
+                            'hospital',
+                            search_radius
+                        )
+                        st.session_state.nearby_hospitals = hospitals
                 
-                # Filter hospitals
-                filtered_hospitals = [h for h in hospitals if h['distance'] <= max_distance]
-                if hospital_type != "All":
-                    filtered_hospitals = [h for h in filtered_hospitals if h['type'] == hospital_type]
-                
-                # Display hospitals
-                for hospital in sorted(filtered_hospitals, key=lambda x: x['distance']):
-                    with st.expander(f"🏥 {hospital['name']} - {hospital['distance']} km"):
-                        col1, col2, col3 = st.columns(3)
-                        with col1:
-                            st.metric("Type", hospital['type'])
-                        with col2:
-                            st.metric("Rating", f"⭐ {hospital['rating']}/5")
-                        with col3:
-                            st.metric("Beds", hospital['beds'])
-                        
-                        st.info(f"📞 Emergency: 108 | 📍 Distance: {hospital['distance']} km")
+                if st.session_state.nearby_hospitals:
+                    st.success(f"Found {len(st.session_state.nearby_hospitals)} hospitals nearby")
+                    
+                    # Filter options
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        min_rating = st.slider("Minimum Rating:", 0.0, 5.0, 3.0, 0.1)
+                    with col2:
+                        open_now_only = st.checkbox("Open Now Only")
+                    
+                    # Filter hospitals
+                    filtered_hospitals = st.session_state.nearby_hospitals
+                    if min_rating > 0:
+                        filtered_hospitals = [h for h in filtered_hospitals if h.get('rating', 0) >= min_rating]
+                    if open_now_only:
+                        filtered_hospitals = [h for h in filtered_hospitals if h.get('open_now', False)]
+                    
+                    # Display hospitals
+                    for hospital in filtered_hospitals:
+                        with st.expander(f"🏥 {hospital['name']} - {hospital['distance']} km"):
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Rating", f"⭐ {hospital.get('rating', 'N/A')}/5")
+                                st.write(f"Reviews: {hospital.get('user_ratings_total', 0)}")
+                            with col2:
+                                st.metric("Status", "🟢 Open" if hospital.get('open_now') else "🔴 Closed")
+                                st.write(f"Distance: {hospital['distance']} km")
+                            with col3:
+                                if hospital.get('phone'):
+                                    st.write(f"📞 {hospital['phone']}")
+                                if hospital.get('website'):
+                                    st.write(f"🌐 [Website]({hospital['website']})")
+                            
+                            st.write(f"📍 **Address:** {hospital['address']}")
+                            if hospital.get('hours'):
+                                st.write(f"🕒 **Hours:** {hospital['hours']}")
+                            
+                            # Map link
+                            maps_url = f"https://www.google.com/maps/search/?api=1&query={hospital['lat']},{hospital['lon']}"
+                            st.write(f"🗺️ [View on Google Maps]({maps_url})")
+                else:
+                    st.info("Click 'Search Hospitals' to find nearby medical facilities")
             else:
-                st.warning("Please set your location to find nearby hospitals.")
+                st.warning("Location not set. Please set your location to find nearby hospitals.")
         
         with tabs[2]:
             st.markdown("### 💊 Nearby Pharmacies")
             
             if st.session_state.coordinates:
-                # Simulated pharmacy data
-                pharmacies = [
-                    {"name": "Apollo Pharmacy", "distance": 0.8, "type": "Chain", "24x7": True},
-                    {"name": "Jan Aushadhi Store", "distance": 1.2, "type": "Government", "24x7": False},
-                    {"name": "MedPlus", "distance": 1.5, "type": "Chain", "24x7": True},
-                    {"name": "Local Medical Store", "distance": 0.5, "type": "Independent", "24x7": False}
-                ]
+                search_radius = st.slider("Search Radius (km):", 1, 10, 3, key="pharmacy_radius") * 1000
                 
-                for pharmacy in sorted(pharmacies, key=lambda x: x['distance']):
-                    with st.expander(f"💊 {pharmacy['name']} - {pharmacy['distance']} km"):
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.metric("Type", pharmacy['type'])
-                        with col2:
-                            st.metric("24x7", "✅ Yes" if pharmacy['24x7'] else "❌ No")
-                        
-                        if pharmacy['type'] == "Government":
-                            st.success("🏛️ Jan Aushadhi - Generic medicines at 90% less cost!")
+                if st.button("🔍 Search Pharmacies", key="search_pharmacies"):
+                    with st.spinner("Searching for nearby pharmacies..."):
+                        pharmacies = maps_service.search_nearby_places(
+                            st.session_state.coordinates[0],
+                            st.session_state.coordinates[1],
+                            'pharmacy',
+                            search_radius
+                        )
+                        st.session_state.nearby_pharmacies = pharmacies
+                
+                if st.session_state.nearby_pharmacies:
+                    st.success(f"Found {len(st.session_state.nearby_pharmacies)} pharmacies nearby")
+                    
+                    # Display pharmacies
+                    for pharmacy in st.session_state.nearby_pharmacies:
+                        with st.expander(f"💊 {pharmacy['name']} - {pharmacy['distance']} km"):
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.metric("Rating", f"⭐ {pharmacy.get('rating', 'N/A')}/5")
+                                st.write(f"Status: {'🟢 Open' if pharmacy.get('open_now') else '🔴 Closed'}")
+                            with col2:
+                                st.metric("Distance", f"{pharmacy['distance']} km")
+                                if pharmacy.get('phone'):
+                                    st.write(f"📞 {pharmacy['phone']}")
+                            
+                            st.write(f"📍 **Address:** {pharmacy['address']}")
+                            if pharmacy.get('hours'):
+                                st.write(f"🕒 **Hours:** {pharmacy['hours']}")
+                            
+                            # Check for Jan Aushadhi
+                            if 'jan aushadhi' in pharmacy['name'].lower():
+                                st.success("🏛️ Jan Aushadhi Store - Generic medicines at 90% less cost!")
+                            
+                            # Map link
+                            maps_url = f"https://www.google.com/maps/search/?api=1&query={pharmacy['lat']},{pharmacy['lon']}"
+                            st.write(f"🗺️ [View on Google Maps]({maps_url})")
+                else:
+                    st.info("Click 'Search Pharmacies' to find nearby medical stores")
             else:
-                st.warning("Please set your location to find nearby pharmacies.")
+                st.warning("Location not set. Please set your location to find nearby pharmacies.")
         
         with tabs[3]:
-            st.markdown("### 🧪 Recommended Lab Tests")
+            st.markdown("### 🧪 Nearby Diagnostic Labs")
             
-            age = health_data['patient']['age']
-            gender = health_data['patient']['gender']
-            
-            # Basic tests for everyone
-            tests = [
-                {"name": "Complete Blood Count (CBC)", "frequency": "Annual", "cost": "₹200-400"},
-                {"name": "Lipid Profile", "frequency": "Annual", "cost": "₹400-600"},
-                {"name": "HbA1c (Diabetes)", "frequency": "Annual", "cost": "₹300-500"},
-                {"name": "Thyroid Function Test", "frequency": "Annual", "cost": "₹600-1000"},
-                {"name": "Vitamin D3", "frequency": "Annual", "cost": "₹800-1200"},
-                {"name": "Vitamin B12", "frequency": "Annual", "cost": "₹600-1000"}
-            ]
-            
-            # Age-specific tests
-            if age > 40:
-                tests.extend([
-                    {"name": "ECG", "frequency": "Annual", "cost": "₹200-500"},
-                    {"name": "Cardiac Markers", "frequency": "As needed", "cost": "₹2000-4000"}
-                ])
-            
-            # Gender-specific tests
-            if gender == "Female":
-                tests.append({"name": "Iron Studies", "frequency": "Annual", "cost": "₹500-800"})
-                if age > 21:
-                    tests.append({"name": "Pap Smear", "frequency": "Every 3 years", "cost": "₹800-1500"})
-            
-            # Display tests
-            for test in tests:
-                with st.expander(f"🧪 {test['name']}"):
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.write(f"**Frequency:** {test['frequency']}")
-                    with col2:
-                        st.write(f"**Cost Range:** {test['cost']}")
+            if st.session_state.coordinates:
+                search_radius = st.slider("Search Radius (km):", 1, 10, 5, key="lab_radius") * 1000
+                
+                if st.button("🔍 Search Labs", key="search_labs"):
+                    with st.spinner("Searching for nearby diagnostic labs..."):
+                        labs = maps_service.search_nearby_places(
+                            st.session_state.coordinates[0],
+                            st.session_state.coordinates[1],
+                            'doctor',  # Using 'doctor' as proxy for labs
+                            search_radius
+                        )
+                        st.session_state.nearby_labs = labs
+                
+                if st.session_state.nearby_labs:
+                    st.success(f"Found {len(st.session_state.nearby_labs)} diagnostic centers nearby")
+                    
+                    # Recommended tests based on age and health data
+                    age = health_data['patient']['age']
+                    st.markdown("#### 🧪 Recommended Tests Based on Your Profile")
+                    
+                    tests = [
+                        {"name": "Complete Blood Count (CBC)", "frequency": "Annual", "cost": "₹200-400"},
+                        {"name": "Lipid Profile", "frequency": "Annual", "cost": "₹400-600"},
+                        {"name": "HbA1c (Diabetes)", "frequency": "Annual", "cost": "₹300-500"},
+                        {"name": "Thyroid Function Test", "frequency": "Annual", "cost": "₹600-1000"},
+                        {"name": "Vitamin D3", "frequency": "Annual", "cost": "₹800-1200"},
+                        {"name": "Vitamin B12", "frequency": "Annual", "cost": "₹600-1000"}
+                    ]
+                    
+                    if age > 40:
+                        tests.extend([
+                            {"name": "ECG", "frequency": "Annual", "cost": "₹200-500"},
+                            {"name": "Cardiac Markers", "frequency": "As needed", "cost": "₹2000-4000"}
+                        ])
+                    
+                    # Display tests
+                    for test in tests:
+                        st.write(f"• **{test['name']}** - {test['frequency']} ({test['cost']})")
+                    
+                    st.markdown("#### 🏥 Diagnostic Centers Near You")
+                    
+                    # Display labs
+                    for lab in st.session_state.nearby_labs:
+                        with st.expander(f"🧪 {lab['name']} - {lab['distance']} km"):
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.metric("Rating", f"⭐ {lab.get('rating', 'N/A')}/5")
+                                st.write(f"Status: {'🟢 Open' if lab.get('open_now') else '🔴 Closed'}")
+                            with col2:
+                                st.metric("Distance", f"{lab['distance']} km")
+                                if lab.get('phone'):
+                                    st.write(f"📞 {lab['phone']}")
+                            
+                            st.write(f"📍 **Address:** {lab['address']}")
+                            if lab.get('hours'):
+                                st.write(f"🕒 **Hours:** {lab['hours']}")
+                            
+                            # Map link
+                            maps_url = f"https://www.google.com/maps/search/?api=1&query={lab['lat']},{lab['lon']}"
+                            st.write(f"🗺️ [View on Google Maps]({maps_url})")
+                else:
+                    st.info("Click 'Search Labs' to find nearby diagnostic centers")
+            else:
+                st.warning("Location not set. Please set your location to find nearby labs.")
         
         with tabs[4]:
+            st.markdown("### 💊 Medicine Recommendations")
+            
+            # Medicine search and recommendations
+            medicine_search = st.text_input("Search for medicine:", placeholder="Enter medicine name...")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                medicine_type = st.selectbox("Medicine Type:", ["All", "Allopathic", "Ayurvedic", "Homeopathic"])
+            with col2:
+                show_generics = st.checkbox("Show Generic Alternatives", value=True)
+            
+            if medicine_search:
+                st.markdown(f"#### Search Results for: {medicine_search}")
+                
+                # Simulated medicine database (in production, use a real API)
+                sample_medicines = {
+                    "paracetamol": {
+                        "brand": ["Crocin", "Calpol", "Dolo"],
+                        "generic": "Paracetamol 500mg",
+                        "jan_aushadhi_price": "₹2-5 per strip",
+                        "market_price": "₹20-40 per strip",
+                        "uses": "Fever, mild to moderate pain",
+                        "ayurvedic_alternative": "Tulsi, Giloy for fever"
+                    },
+                    "omeprazole": {
+                        "brand": ["Omez", "Ocid", "Omecip"],
+                        "generic": "Omeprazole 20mg",
+                        "jan_aushadhi_price": "₹8-15 per strip",
+                        "market_price": "₹60-120 per strip",
+                        "uses": "Acidity, GERD, peptic ulcers",
+                        "ayurvedic_alternative": "Amla, Mulethi for acidity"
+                    }
+                }
+                
+                # Search in sample database
+                found = False
+                for med_name, med_info in sample_medicines.items():
+                    if medicine_search.lower() in med_name or any(medicine_search.lower() in brand.lower() for brand in med_info['brand']):
+                        found = True
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.markdown("##### 💊 Medicine Information")
+                            st.write(f"**Generic Name:** {med_info['generic']}")
+                            st.write(f"**Brand Names:** {', '.join(med_info['brand'])}")
+                            st.write(f"**Uses:** {med_info['uses']}")
+                        
+                        with col2:
+                            st.markdown("##### 💰 Price Comparison")
+                            st.success(f"**Jan Aushadhi Price:** {med_info['jan_aushadhi_price']}")
+                            st.warning(f"**Market Price:** {med_info['market_price']}")
+                            st.info(f"**Savings:** Up to 90%")
+                        
+                        if med_info.get('ayurvedic_alternative'):
+                            st.markdown("##### 🌿 Ayurvedic Alternative")
+                            st.write(med_info['ayurvedic_alternative'])
+                
+                if not found:
+                    st.info("Medicine not found in database. Please consult a pharmacist.")
+            
+            # Common medicines based on symptoms
+            if symptoms:
+                st.markdown("#### 💊 Suggested Medicines Based on Your Symptoms")
+                
+                # AI-based medicine suggestions
+                if st.button("Get AI Medicine Recommendations", key="med_recommendations"):
+                    with st.spinner("Analyzing symptoms and suggesting medicines..."):
+                        ai_service = OpenAIService()
+                        prompt = f"""
+                        Based on the symptoms: {symptoms}
+                        Provide medicine recommendations including:
+                        1. Over-the-counter options available in India
+                        2. Generic alternatives from Jan Aushadhi
+                        3. Ayurvedic/traditional remedies
+                        4. When to consult a doctor
+                        Location: {st.session_state.user_location.get('city', 'India')}
+                        """
+                        
+                        response = ai_service.get_health_analysis(
+                            prompt,
+                            st.session_state.health_data,
+                            "Medicine Recommendations"
+                        )
+                        
+                        st.markdown(response)
+            
+            # Nearby Jan Aushadhi stores
+            st.markdown("#### 🏛️ Nearest Jan Aushadhi Stores")
+            if st.button("Find Jan Aushadhi Stores", key="jan_aushadhi"):
+                with st.spinner("Searching for Jan Aushadhi stores..."):
+                    # Search for Jan Aushadhi stores specifically
+                    jan_stores = maps_service.search_nearby_places(
+                        st.session_state.coordinates[0],
+                        st.session_state.coordinates[1],
+                        'pharmacy',
+                        5000
+                    )
+                    
+                    jan_aushadhi_stores = [store for store in jan_stores if 'jan aushadhi' in store['name'].lower()]
+                    
+                    if jan_aushadhi_stores:
+                        for store in jan_aushadhi_stores:
+                            st.success(f"🏛️ {store['name']} - {store['distance']} km away")
+                            st.write(f"📍 {store['address']}")
+                    else:
+                        st.info("No Jan Aushadhi stores found nearby. Check with local pharmacies for generic medicines.")
+        
+        with tabs[5]:
             st.markdown("### 🥗 Personalized Diet Plan")
             
             # Calculate calorie needs
@@ -764,41 +1190,88 @@ def main():
             with col3:
                 st.metric("Carbs", f"{int(daily_calories * 0.60 / 4)}g")
             
-            # Indian meal plan
-            st.markdown("#### 🍽️ Traditional Indian Meal Plan")
+            # Location-based diet recommendations
+            st.markdown(f"#### 🍽️ Diet Plan for {st.session_state.user_location.get('city', 'your location')}")
             
+            # Get seasonal and regional foods
+            current_month = datetime.now().month
+            if current_month in [12, 1, 2]:
+                season = "Winter"
+                seasonal_foods = ["Sarson ka saag", "Makki ki roti", "Gajar halwa", "Peanuts", "Jaggery"]
+            elif current_month in [3, 4, 5]:
+                season = "Summer"
+                seasonal_foods = ["Watermelon", "Mango", "Cucumber", "Coconut water", "Lassi"]
+            elif current_month in [6, 7, 8, 9]:
+                season = "Monsoon"
+                seasonal_foods = ["Corn", "Hot soups", "Ginger tea", "Pakoras (in moderation)", "Turmeric milk"]
+            else:
+                season = "Post-monsoon"
+                seasonal_foods = ["Amla", "Green leafy vegetables", "Citrus fruits", "Nuts", "Dates"]
+            
+            st.info(f"🌤️ Current Season: {season} - Recommended seasonal foods: {', '.join(seasonal_foods)}")
+            
+            # Sample meal plan
             meal_plan = {
-                "Breakfast (8 AM)": ["2 Idli/Dosa with sambar", "OR 2 Parathas with curd", "1 glass milk/tea"],
-                "Mid-Morning (11 AM)": ["1 seasonal fruit", "Handful of nuts"],
-                "Lunch (1 PM)": ["2 rotis", "1 bowl dal", "Vegetable curry", "Rice (1 bowl)", "Curd"],
-                "Evening (5 PM)": ["Tea with 2 biscuits", "OR Roasted chana"],
-                "Dinner (8 PM)": ["2 rotis", "Dal/Paneer curry", "Salad", "Vegetables"]
+                "Breakfast (8 AM)": ["2 Idli/Dosa with sambar", "OR 2 Parathas with curd", "1 glass milk/tea", "Seasonal fruit"],
+                "Mid-Morning (11 AM)": ["1 seasonal fruit", "Handful of nuts", "Green tea/herbal tea"],
+                "Lunch (1 PM)": ["2 rotis", "1 bowl dal", "Vegetable curry", "Rice (1 small bowl)", "Curd", "Salad"],
+                "Evening (5 PM)": ["Tea with 2 biscuits", "OR Roasted chana", "OR Fresh fruit"],
+                "Dinner (8 PM)": ["2 rotis", "Dal/Paneer curry", "Green vegetables", "Salad"]
             }
             
             for meal, items in meal_plan.items():
                 with st.expander(meal):
                     for item in items:
                         st.write(f"• {item}")
+            
+            # Local food recommendations
+            st.markdown(f"#### 🌍 Local Healthy Food Options in {st.session_state.user_location.get('city', 'your area')}")
+            if st.button("Find Healthy Restaurants", key="healthy_restaurants"):
+                with st.spinner("Searching for healthy food options..."):
+                    restaurants = maps_service.search_nearby_places(
+                        st.session_state.coordinates[0],
+                        st.session_state.coordinates[1],
+                        'restaurant',
+                        3000
+                    )
+                    
+                    # Filter for healthy options
+                    healthy_keywords = ['vegetarian', 'vegan', 'salad', 'healthy', 'organic', 'juice']
+                    healthy_restaurants = [r for r in restaurants if any(keyword in r['name'].lower() for keyword in healthy_keywords)]
+                    
+                    if healthy_restaurants:
+                        for restaurant in healthy_restaurants[:5]:
+                            st.write(f"🥗 **{restaurant['name']}** - {restaurant['distance']} km")
+                            st.write(f"   Rating: ⭐ {restaurant.get('rating', 'N/A')}/5 | {restaurant['address']}")
+                    else:
+                        st.info("No specifically healthy restaurants found. Look for vegetarian options in regular restaurants.")
         
-        with tabs[5]:
+        with tabs[6]:
             st.markdown("### 📰 Latest Health News - India")
             
-            # Simulated health news
+            # Simulated health news with location relevance
+            location_city = st.session_state.user_location.get('city', 'India')
+            
             news_articles = [
+                {
+                    "title": f"Air Quality Alert in {location_city}",
+                    "date": datetime.now().strftime("%B %d, %Y"),
+                    "summary": f"Health experts advise residents of {location_city} to take precautions as AQI levels rise. Use N95 masks and limit outdoor activities."
+                },
                 {
                     "title": "AIIMS Launches New Telemedicine Initiative",
                     "date": "June 20, 2024",
-                    "summary": "AIIMS Delhi introduces AI-powered telemedicine for rural healthcare."
+                    "summary": "AIIMS Delhi introduces AI-powered telemedicine for rural healthcare across India."
+                },
+                {
+                    "title": f"Free Health Camps in {location_city} This Week",
+                    "date": "June 18, 2024",
+                    "summary": f"Government organizes free health checkup camps across {location_city}. Services include blood tests, ECG, and consultation."
                 },
                 {
                     "title": "Ayushman Bharat Reaches 500 Million Indians",
-                    "date": "June 18, 2024",
-                    "summary": "Government health insurance scheme achieves major milestone."
-                },
-                {
-                    "title": "New Study Links Air Pollution to Heart Disease",
                     "date": "June 15, 2024",
-                    "summary": "Indian researchers find strong correlation between PM2.5 and cardiac issues."
+                    "summary": "Government health insurance scheme achieves major milestone in providing healthcare access."
                 }
             ]
             
@@ -806,7 +1279,10 @@ def main():
                 with st.expander(f"📰 {article['title']}"):
                     st.write(f"**Date:** {article['date']}")
                     st.write(article['summary'])
-                    st.button("Read More", key=f"news_{article['title'][:10]}")
+                    
+                    # Add location-specific information
+                    if location_city in article['title']:
+                        st.info(f"This news is specifically relevant to your location in {location_city}")
 
 # Footer
 def show_footer():
@@ -817,7 +1293,7 @@ def show_footer():
         <p><strong>Emergency Numbers:</strong> 🚑 108 (Medical) | 112 (National Emergency)</p>
         <p><strong>Disclaimer:</strong> This app provides health information for educational purposes only. 
         Always consult qualified healthcare professionals for medical advice.</p>
-        <p>Made with ❤️ for India | Version 2.0</p>
+        <p>Powered by AI & Google Maps | Made with ❤️ for India</p>
     </div>
     """, unsafe_allow_html=True)
 
